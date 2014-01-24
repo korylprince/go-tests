@@ -1,52 +1,110 @@
 package main
 
-import "net"
-import "fmt"
+import (
+    "fmt"
+    "io"
+    "net"
+)
 
-type Broadcast struct {
-    Message []byte
-    Sender  net.Conn
+type Identifier string
+
+type Message struct {
+    Body      []byte
+    Sender    Identifier
+    Recipient Identifier
 }
 
-type ConnectionList []net.Conn
+type Client struct {
+    Conn       *net.Conn
+    Messages   chan Message
+    Identifier Identifier
+    Closed     bool
+}
 
-func broadcaster(conns []net.Conn, broadcastListener chan Broadcast) {
+func (client *Client) ReadHandler(messages chan Message) {
+    conn := *client.Conn
     for {
-        b := <-broadcastListener
-        for _, v := range conns {
-            if v != nil && v != b.Sender {
-                go v.Write(b.Message)
+        buf := make([]byte, 256)
+        _, err := conn.Read(buf)
+        if err != nil {
+            if err != io.EOF {
+                fmt.Printf("Read error in %s: %#v\n", client.Identifier, err)
+                err = client.Close()
+                if err != nil {
+                    fmt.Printf("Close error in %s: %#v\n", client.Identifier, err)
+                }
+            }
+            return
+        }
+        messages <- Message{buf, client.Identifier, "*"}
+    }
+}
+
+func (client *Client) WriteHandler() {
+    conn := *client.Conn
+    for {
+        message := <-client.Messages
+        _, err := conn.Write(message.Body)
+        if err != nil {
+            if err != io.EOF {
+                fmt.Printf("Write error in %s: %#v\n", client.Identifier, err)
+                err = client.Close()
+                if err != nil {
+                    fmt.Printf("Close error in %s: %#v\n", client.Identifier, err)
+                }
+            }
+            return
+        }
+    }
+}
+
+func (client *Client) Close() error {
+    err := (*client.Conn).Close()
+    client.Closed = true
+    return err
+}
+
+func NewClient(conn *net.Conn) Client {
+    return Client{Conn: conn, Messages: make(chan Message, 1024),
+        Identifier: Identifier(fmt.Sprint((*conn).LocalAddr(), (*conn).RemoteAddr()))}
+}
+
+func MessageRouter(clients chan Client, messages chan Message) {
+    clientList := make(map[Identifier]Client)
+    for {
+        select {
+        case client := <-clients:
+            clientList[client.Identifier] = client
+        case message := <-messages:
+            for _, client := range clientList {
+                if client.Closed {
+                    delete(clientList, client.Identifier)
+                } else if message.Sender != client.Identifier {
+                    client.Messages <- message
+                }
             }
         }
     }
-}
 
-func handler(conn net.Conn, broadcastListener chan Broadcast) {
-    buf := make([]byte, 255)
-    for {
-        conn.Read(buf)
-        broadcastListener <- Broadcast{buf, conn}
-    }
 }
 
 func main() {
-    conns := make([]net.Conn, 100)
-    broadcastListener := make(chan Broadcast)
-    go broadcaster(conns, broadcastListener)
+    clients := make(chan Client, 1024)
+    messages := make(chan Message, 1024)
+    go MessageRouter(clients, messages)
 
-    listener, err := net.Listen("tcp", ":8080")
+    server, err := net.Listen("tcp", ":8080")
     if err != nil {
         panic(err)
     }
-    i := 0
     for {
-        conn, err := listener.Accept()
+        conn, err := server.Accept()
         if err != nil {
             panic(err)
         }
-        fmt.Println("Got connection from:", conn.RemoteAddr())
-        conns[i] = conn
-        i++
-        go handler(conn, broadcastListener)
+        client := NewClient(&conn)
+        clients <- client
+        go client.ReadHandler(messages)
+        go client.WriteHandler()
     }
 }
